@@ -1,0 +1,76 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1786362654943,
+      "tag": "0000_talented_talos",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1786364145030,
+      "tag": "0001_nasty_omega_sentinel",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1786454374546,
+      "tag": "0002_ancient_master_chief",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1786466019844,
+      "tag": "0003_white_living_lightning",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1786552419844,
+      "tag": "0004_worried_black_bolt",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1787651235509,
+      "tag": "0005_charming_blade",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1789852872540,
+      "tag": "0006_wild_lifeguard",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1791868800000,
+      "tag": "0007_admin_stats",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1792051520492,
+      "tag": "0008_generated_models",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1792055555165,
+      "tag": "0009_privacy_consent",
+      "breakpoints": true
+    }
+  ]
+}

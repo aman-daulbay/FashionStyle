@@ -1,0 +1,986 @@
+"use client";
+
+import Link from "next/link";
+import { useSearchParams } from "next/navigation";
+import { useEffect, useState } from "react";
+import { CATEGORY_LABELS, type CatalogCategory } from "@/lib/categories";
+import { catalogImageUrl } from "@/lib/catalogDisplay";
+import { useStoredProfile, type StoredProfile } from "@/lib/profileStorage";
+import { DataConsent } from "@/components/DataConsent";
+import { PRIVACY_VERSION } from "@/lib/privacy";
+import { hasAnalyticsConsent } from "@/lib/privacyStorage";
+import { cn } from "@/lib/utils";
+import { GenerationNotice } from "@/components/GenerationNotice";
+import { Carousel } from "@/components/tryon/Carousel";
+import { getVisitorId, track } from "@/lib/analytics";
+
+// Клиентский предохранитель: если сервер вообще не ответит, не виснем
+// бесконечно. Примерка — один вызов Gemini в 1K (обычно ~15–40 сек, см.
+// lib/gemini.ts). Держим запас на холодный старт serverless-функции и один
+// авто-ретрай на стороне сервера (до ~3 мин в худшем случае).
+const CLIENT_TIMEOUT_MS = 4 * 60 * 1000;
+
+interface Item {
+  id: string;
+  category: string;
+  color: string | null;
+  description: string | null;
+  imagePath: string;
+  lookId: string;
+}
+
+// Полный образ (комплект) — все вещи одного look_id по слотам. Примеряется
+// целиком за один вызов Gemini (верхняя одежда надевается ПОВЕРХ верха).
+interface LookItem {
+  id: string;
+  category: string;
+  color: string | null;
+  description: string | null;
+  imagePath: string;
+}
+
+interface Look {
+  lookId: string;
+  cover: string; // /catalog/looks/<lookId>.jpg — модель в полном образе
+  fallbackImage: string; // фото одной вещи образа — если обложки нет
+  outerwearId?: string;
+  topId?: string;
+  bottomId?: string;
+  shoesId?: string;
+  bagId?: string;
+  itemCount: number;
+  items: LookItem[]; // вещи образа по слотам — состав комплекта
+}
+
+function itemsPlural(n: number): string {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return `${n} вещь`;
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20))
+    return `${n} вещи`;
+  return `${n} вещей`;
+}
+
+interface TryonResult {
+  id: string;
+  resultImagePath: string;
+  createdAt: string;
+}
+
+function ItemThumb({
+  item,
+  selected,
+  onClick,
+}: {
+  item: Item;
+  selected: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={selected}
+      className="group w-24 shrink-0 text-left sm:w-28"
+    >
+      <div
+        className={
+          "relative aspect-[3/4] overflow-hidden bg-canvas-2 transition-all duration-300 " +
+          (selected
+            ? "ring-2 ring-clay ring-offset-2 ring-offset-canvas"
+            : "ring-1 ring-hair-ink")
+        }
+      >
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={catalogImageUrl(item.imagePath)}
+          alt={item.description ?? item.category}
+          className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-105"
+        />
+        {selected && (
+          <span className="absolute bottom-0 left-0 right-0 bg-clay py-1 text-center font-grotesk text-[9px] uppercase tracking-[0.2em] text-canvas">
+            выбрано
+          </span>
+        )}
+      </div>
+      <p className="mt-2 line-clamp-2 font-grotesk text-[10px] leading-tight text-ink-soft">
+        {item.description ?? CATEGORY_LABELS[item.category as CatalogCategory]}
+      </p>
+    </button>
+  );
+}
+
+// Карточка готового образа: обложка (модель в полном комплекте) с откатом на
+// фото одной вещи, если обложки нет.
+function LookCardButton({
+  look,
+  selected,
+  onClick,
+}: {
+  look: Look;
+  selected: boolean;
+  onClick: () => void;
+}) {
+  const [src, setSrc] = useState(look.cover);
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={selected}
+      className="group text-left"
+    >
+      <div
+        className={
+          "relative aspect-[3/4] overflow-hidden bg-canvas-2 transition-all duration-300 " +
+          (selected
+            ? "ring-2 ring-clay ring-offset-2 ring-offset-canvas"
+            : "ring-1 ring-hair-ink")
+        }
+      >
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={src}
+          onError={() =>
+            setSrc((cur) =>
+              cur === look.fallbackImage ? cur : look.fallbackImage,
+            )
+          }
+          alt={`Готовый образ ${look.lookId}`}
+          className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-105"
+        />
+        <span className="absolute left-0 top-0 bg-espresso px-2.5 py-1.5 font-grotesk text-[9px] uppercase tracking-[0.2em] text-canvas-dim">
+          {itemsPlural(look.itemCount)}
+        </span>
+        {selected && (
+          <span className="absolute inset-x-0 bottom-0 bg-clay py-1 text-center font-grotesk text-[9px] uppercase tracking-[0.2em] text-canvas">
+            выбрано
+          </span>
+        )}
+      </div>
+    </button>
+  );
+}
+
+const AGE_RANGE_LABELS: Record<string, string> = {
+  "0-18": "0–18 лет",
+  "18-25": "18–25 лет",
+  "26-35": "26–35 лет",
+  "36-45": "36–45 лет",
+  "45+": "45+ лет",
+};
+
+const SKIN_TONE_LABELS: Record<string, string> = {
+  fair: "Светлый тон",
+  light: "Светло-смуглый",
+  medium: "Смуглый",
+  deep: "Тёмный тон",
+};
+
+const POSE_LABELS: Record<string, string> = {
+  front: "Фас",
+  "three-quarter": "Три четверти",
+  motion: "В движении",
+};
+
+function ProfileSummary({
+  profile,
+  editHref,
+}: {
+  profile: StoredProfile;
+  editHref: string;
+}) {
+  const badges = [
+    `${profile.heightCm} см`,
+    `${profile.weightKg} кг`,
+    profile.ageRange
+      ? (AGE_RANGE_LABELS[profile.ageRange] ?? profile.ageRange)
+      : null,
+    profile.skinTone
+      ? (SKIN_TONE_LABELS[profile.skinTone] ?? profile.skinTone)
+      : null,
+    profile.clothingSize ? `Размер ${profile.clothingSize}` : null,
+    profile.pose ? (POSE_LABELS[profile.pose] ?? profile.pose) : null,
+  ].filter((b): b is string => Boolean(b));
+
+  // photoPath заполняется и загруженным фото, и сгенерированной моделью
+  // (см. app/api/profile) — здесь показываем, на чём именно будет примерка,
+  // чтобы это не было чёрным ящиком.
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-2 border-y border-hair-ink py-4">
+      <span className="relative h-14 w-11 shrink-0 overflow-hidden bg-canvas-2 ring-1 ring-hair-ink">
+        {profile.photoPath ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={profile.photoPath}
+            alt="Модель для примерки"
+            className="h-full w-full object-cover"
+          />
+        ) : null}
+      </span>
+      {badges.map((badge) => (
+        <span
+          key={badge}
+          className="border border-hair-ink px-2.5 py-1 font-grotesk text-[10px] uppercase tracking-[0.14em] text-ink-soft"
+        >
+          {badge}
+        </span>
+      ))}
+      <Link
+        href={editHref}
+        className="font-grotesk text-[10px] uppercase tracking-[0.2em] text-clay transition-colors hover:text-ink"
+      >
+        Изменить анкету
+      </Link>
+    </div>
+  );
+}
+
+function ResultImage({ src, alt }: { src: string; alt: string }) {
+  const [failed, setFailed] = useState(false);
+
+  if (failed) {
+    return (
+      <div className="flex h-full w-full items-center justify-center bg-bone-soft px-2 text-center text-[11px] text-ink-soft">
+        Не удалось загрузить изображение
+      </div>
+    );
+  }
+
+  return (
+    // eslint-disable-next-line @next/next/no-img-element
+    <img
+      src={src}
+      alt={alt}
+      onError={() => setFailed(true)}
+      className="h-full w-full object-cover"
+    />
+  );
+}
+
+function formatDate(iso: string): string {
+  try {
+    return new Date(iso).toLocaleString("ru-RU", {
+      day: "numeric",
+      month: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return iso;
+  }
+}
+
+async function downloadImage(url: string, filename: string) {
+  try {
+    const res = await fetch(url);
+    const blob = await res.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = blobUrl;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(blobUrl);
+  } catch {
+    window.open(url, "_blank");
+  }
+}
+
+export function TryonForm({
+  tops,
+  bottoms,
+  shoes,
+  bags,
+  looks,
+}: {
+  tops: Item[];
+  bottoms: Item[];
+  shoes: Item[];
+  bags: Item[];
+  looks: Look[];
+}) {
+  const profile = useStoredProfile();
+  const searchParams = useSearchParams();
+  const returnTo = `/tryon${searchParams.size ? `?${searchParams}` : ""}`;
+  const profileHref = `/profile?returnTo=${encodeURIComponent(returnTo)}`;
+  const [dataConsent, setDataConsent] = useState(false);
+  const consentAccepted =
+    profile?.dataConsentVersion === PRIVACY_VERSION || dataConsent;
+  const [outerwearId, setOuterwearId] = useState<string | null>(() =>
+    searchParams.get("outerwear"),
+  );
+  // Примерочная (см. app/fitting-room) может передать сюда предвыбор через
+  // ?top=/?bottom= — читаем один раз при монтировании.
+  const [topId, setTopId] = useState<string | null>(() =>
+    searchParams.get("top"),
+  );
+  const [bottomId, setBottomId] = useState<string | null>(() =>
+    searchParams.get("bottom"),
+  );
+  const [shoesId, setShoesId] = useState<string | null>(() =>
+    searchParams.get("shoes"),
+  );
+  const [bagId, setBagId] = useState<string | null>(() =>
+    searchParams.get("bag"),
+  );
+  const [status, setStatus] = useState<"idle" | "loading">("idle");
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<TryonResult | null>(null);
+  const [matches, setMatches] = useState<Item[]>([]);
+  const [history, setHistory] = useState<TryonResult[] | null>(null);
+  // Остаток суточного лимита примерок (профиль + IP, считается на сервере,
+  // см. lib/tryonLimit.ts). null — ещё не загрузили.
+  const [usage, setUsage] = useState<{
+    limit: number;
+    remaining: number;
+  } | null>(null);
+  // Режим примерки: «полный образ» (комплект целиком) или «по частям».
+  // Если пришли из примерочной с предвыбором вещей — сразу «по частям».
+  const hasPreselect = Boolean(
+    searchParams.get("outerwear") ||
+      searchParams.get("top") ||
+      searchParams.get("bottom") ||
+      searchParams.get("shoes") ||
+      searchParams.get("bag"),
+  );
+  const [mode, setMode] = useState<"full" | "pieces">(
+    hasPreselect || looks.length === 0 ? "pieces" : "full",
+  );
+  const [selectedLookId, setSelectedLookId] = useState<string | null>(() =>
+    looks.some((look) => look.lookId === searchParams.get("look"))
+      ? searchParams.get("look")
+      : null,
+  );
+
+  // Пришёл из примерочной/каталога с уже выбранными вещами — это тоже шаг
+  // воронки «выбрал образ».
+  useEffect(() => {
+    if (hasPreselect || searchParams.get("look"))
+      track("look_selected", { lookId: searchParams.get("look") });
+  }, [hasPreselect, searchParams]);
+
+  // Якорь для рекомендаций "Дополните образ" — первая выбранная вещь любой
+  // категории. Пока ничего не выбрано (свежий заход без предвыбора), anchor
+  // остаётся null — и блок ниже явно показывает подсказку вместо того, чтобы
+  // тихо пропасть (это и была причина жалобы "не работает" — см. план).
+  const anchorId = topId ?? outerwearId ?? bottomId ?? shoesId ?? bagId;
+
+  useEffect(() => {
+    let cancelled = false;
+    const request = anchorId
+      ? fetch(`/api/catalog/${anchorId}/matches`)
+          .then((res) => res.json())
+          .then((data) => data.items ?? [])
+      : Promise.resolve([]);
+
+    request
+      .then((items) => {
+        if (!cancelled) setMatches(items);
+      })
+      .catch(() => {
+        if (!cancelled) setMatches([]);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [anchorId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const request = profile
+      ? fetch(`/api/tryon/history?userId=${profile.id}`).then((res) =>
+          res.json(),
+        )
+      : Promise.resolve(null);
+
+    request
+      .then((data) => {
+        if (cancelled) return;
+        setHistory(data ? (data.items ?? []) : null);
+        if (data?.usage) setUsage(data.usage);
+      })
+      .catch(() => {
+        if (!cancelled) setHistory([]);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [profile]);
+
+  const selectedIds = new Set(
+    [outerwearId, topId, bottomId, shoesId, bagId].filter(Boolean),
+  );
+  const visibleMatches = matches.filter((item) => !selectedIds.has(item.id));
+  const selectedCount = selectedIds.size;
+
+  const selectedLook = looks.find((l) => l.lookId === selectedLookId) ?? null;
+  const currentSelection = new URLSearchParams();
+  if (mode === "full" && selectedLook)
+    currentSelection.set("look", selectedLook.lookId);
+  else
+    for (const [slot, id] of Object.entries({
+      outerwear: outerwearId,
+      top: topId,
+      bottom: bottomId,
+      shoes: shoesId,
+      bag: bagId,
+    })) {
+      if (id) currentSelection.set(slot, id);
+    }
+  const editHref = `/profile?returnTo=${encodeURIComponent(`/tryon${currentSelection.size ? `?${currentSelection}` : ""}`)}`;
+
+  // Суточный лимит исчерпан — блокируем кнопки примерки (сервер всё равно
+  // вернёт 429, но так пользователь видит причину сразу).
+  const limitReached = usage !== null && usage.remaining <= 0;
+
+  function toggleTop(id: string) {
+    if (tops.find((item) => item.id === id)?.category === "outerwear")
+      setOuterwearId(null);
+    track("look_selected");
+    setTopId((current) => (current === id ? null : id));
+    setResult(null);
+  }
+
+  function toggleBottom(id: string) {
+    track("look_selected");
+    setBottomId((current) => (current === id ? null : id));
+    setResult(null);
+  }
+
+  function toggleShoes(id: string) {
+    track("look_selected");
+    setShoesId((current) => (current === id ? null : id));
+    setResult(null);
+  }
+
+  function toggleBag(id: string) {
+    track("look_selected");
+    setBagId((current) => (current === id ? null : id));
+    setResult(null);
+  }
+
+  // Общий вызов примерки. payload — набор *ItemId (верх/низ/обувь/сумка +
+  // outerwearItemId для полного образа); userId дописывается здесь.
+  async function runTryOn(payload: Record<string, string | null | undefined>) {
+    if (!profile || !consentAccepted) return;
+    setStatus("loading");
+    setError(null);
+    setResult(null);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), CLIENT_TIMEOUT_MS);
+
+    try {
+      const response = await fetch("/api/tryon", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId: profile.id,
+          visitorId: getVisitorId(),
+          dataConsentVersion: PRIVACY_VERSION,
+          analyticsConsentVersion: hasAnalyticsConsent()
+            ? PRIVACY_VERSION
+            : null,
+          ...payload,
+        }),
+        signal: controller.signal,
+      });
+      const data = await response.json();
+      // Сервер возвращает актуальный остаток лимита и при успехе, и при 429 —
+      // синхронизируем счётчик в любом случае.
+      if (data.usage) setUsage(data.usage);
+      if (!response.ok) {
+        setError(data.message ?? "Не удалось выполнить примерку");
+        setStatus("idle");
+        return;
+      }
+      const newResult: TryonResult = data.result;
+      setResult(newResult);
+      setHistory((prev) => (prev ? [newResult, ...prev] : [newResult]));
+      setStatus("idle");
+    } catch (err) {
+      setError(
+        err instanceof DOMException && err.name === "AbortError"
+          ? "Не дождались ответа от нейросети — попробуй ещё раз"
+          : "Не удалось связаться с сервером",
+      );
+      setStatus("idle");
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  function handleTryOn() {
+    if (!outerwearId && !topId && !bottomId && !shoesId && !bagId) return;
+    runTryOn({
+      outerwearItemId: outerwearId,
+      topItemId: topId,
+      bottomItemId: bottomId,
+      shoesItemId: shoesId,
+      bagItemId: bagId,
+    });
+  }
+
+  function handleTryOnLook() {
+    if (!selectedLook) return;
+    runTryOn({
+      lookId: selectedLook.lookId,
+      outerwearItemId: selectedLook.outerwearId,
+      topItemId: selectedLook.topId,
+      bottomItemId: selectedLook.bottomId,
+      shoesItemId: selectedLook.shoesId,
+      bagItemId: selectedLook.bagId,
+    });
+  }
+
+  // Без анкеты примерять не на что. Раньше здесь был один абзац, из которого
+  // невозможно было понять, что фото вообще необязательно — генерация модели
+  // была спрятана тумблером в самом низу анкеты. Теперь это явная развилка
+  // из двух равноправных путей.
+  if (!profile) {
+    return (
+      <div className="mt-10 animate-fade-in-up">
+        <p className="max-w-lg font-grotesk text-sm leading-relaxed text-ink-soft">
+          Для примерки нужна модель — фигура, на которую нейросеть положит вещь.
+          Выбери, откуда её взять:
+        </p>
+
+        <div className="mt-6 grid gap-4 sm:grid-cols-2">
+          <Link
+            href={profileHref}
+            className="group relative border border-hair-ink bg-canvas-2 p-6 transition-colors hover:border-ink"
+          >
+            <span className="font-display text-3xl text-clay">01</span>
+            <h3 className="mt-3 font-display text-xl uppercase tracking-tight text-ink">
+              Своё фото
+            </h3>
+            <p className="mt-2 font-grotesk text-[13px] leading-relaxed text-ink-soft">
+              Снимок в полный рост — результат будет максимально похож на тебя.
+            </p>
+            <span className="mt-5 block h-px w-full bg-hair-ink">
+              <span className="block h-px w-0 bg-clay transition-all duration-500 group-hover:w-full" />
+            </span>
+          </Link>
+
+          <Link
+            href={`${profileHref}&model=generated`}
+            className="group relative border border-clay bg-clay/5 p-6 transition-colors hover:bg-clay/10"
+          >
+            <span className="font-display text-3xl text-clay">02</span>
+            <h3 className="mt-3 font-display text-xl uppercase tracking-tight text-ink">
+              Модель по анкете
+            </h3>
+            <p className="mt-2 font-grotesk text-[13px] leading-relaxed text-ink-soft">
+              Фото не нужно. Соберём женскую или мужскую модель по росту, весу,
+              телосложению, тону кожи и позе.
+            </p>
+            <span className="mt-5 block h-px w-full bg-hair-ink">
+              <span className="block h-px w-0 bg-clay transition-all duration-500 group-hover:w-full" />
+            </span>
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-8 flex flex-col gap-8">
+      <nav
+        aria-label="Этапы примерки"
+        className="grid grid-cols-3 gap-3 border-b border-hair-ink pb-6 text-xs"
+      >
+        {["Твоя модель", "Твой образ", "Результат"].map((label, index) => (
+          <span
+            key={label}
+            className={cn(
+              "flex items-center gap-2 text-ink-soft",
+              ((result && index === 2) || (!result && index === 1)) &&
+                "text-clay",
+            )}
+          >
+            <span className="flex size-7 shrink-0 items-center justify-center rounded-full border border-hair-ink tabular-nums">
+              {index + 1}
+            </span>
+            {label}
+          </span>
+        ))}
+      </nav>
+      <GenerationNotice />
+      {profile.dataConsentVersion !== PRIVACY_VERSION && (
+        <DataConsent checked={dataConsent} onChange={setDataConsent} />
+      )}
+      <ProfileSummary profile={profile} editHref={editHref} />
+
+      {looks.length > 0 && (
+        <div className="flex flex-wrap gap-2.5">
+          {(
+            [
+              ["full", "Полный образ"],
+              ["pieces", "Собрать по частям"],
+            ] as const
+          ).map(([m, label]) => (
+            <button
+              key={m}
+              type="button"
+              onClick={() => {
+                setMode(m);
+                setResult(null);
+              }}
+              className={
+                "px-5 py-2.5 font-grotesk text-[11px] uppercase tracking-[0.18em] transition-colors " +
+                (mode === m
+                  ? "bg-espresso text-canvas"
+                  : "border border-hair-ink text-ink-soft hover:border-ink")
+              }
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {looks.length > 0 && mode === "full" ? (
+        <section className="flex flex-col gap-6">
+          <div>
+            <p className="border-b border-hair-ink pb-2.5 font-grotesk text-[10px] uppercase tracking-[0.3em] text-ink-soft">
+              Готовые образы · {looks.length}
+            </p>
+            <p className="mt-4 max-w-lg font-grotesk text-sm leading-relaxed text-ink-soft">
+              Выбери образ целиком — нейросеть наденет на тебя все вещи
+              комплекта за один раз: верх, верхнюю одежду, низ, обувь и сумку.
+            </p>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+            {looks.map((look) => (
+              <LookCardButton
+                key={look.lookId}
+                look={look}
+                selected={selectedLookId === look.lookId}
+                onClick={() => {
+                  setSelectedLookId(look.lookId);
+                  track("look_selected", { lookId: look.lookId });
+                  setResult(null);
+                }}
+              />
+            ))}
+          </div>
+
+          {selectedLook && (
+            <div className="animate-fade-in-up border-t border-hair-ink pt-6">
+              <p className="font-grotesk text-[10px] uppercase tracking-[0.3em] text-ink-soft">
+                Что в образе · {itemsPlural(selectedLook.items.length)}
+              </p>
+              <p className="mt-3 font-grotesk text-[13px] leading-relaxed text-ink-soft">
+                Нажми на любую вещь, чтобы открыть её карточку и рассмотреть
+                отдельно.
+              </p>
+              <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+                {selectedLook.items.map((item) => (
+                  <Link
+                    key={item.id}
+                    href={`/catalog/${item.id}`}
+                    className="group text-left"
+                  >
+                    <div className="relative aspect-[3/4] overflow-hidden bg-canvas-2 ring-1 ring-hair-ink transition-all group-hover:ring-clay">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={catalogImageUrl(item.imagePath)}
+                        alt={item.description ?? item.category}
+                        className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-105"
+                      />
+                      <span className="absolute left-0 top-0 bg-espresso px-2 py-1 font-grotesk text-[8px] uppercase tracking-[0.18em] text-canvas-dim">
+                        {CATEGORY_LABELS[item.category as CatalogCategory] ??
+                          item.category}
+                      </span>
+                    </div>
+                    <p className="mt-2 line-clamp-2 font-grotesk text-[11px] leading-tight text-ink transition-colors group-hover:text-clay">
+                      {item.description ??
+                        CATEGORY_LABELS[item.category as CatalogCategory] ??
+                        item.category}
+                    </p>
+                    <span className="mt-1 inline-block font-grotesk text-[9px] uppercase tracking-[0.2em] text-ink-soft transition-colors group-hover:text-clay">
+                      к вещи →
+                    </span>
+                  </Link>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <button
+            type="button"
+            onClick={handleTryOnLook}
+            disabled={
+              !selectedLook ||
+              status === "loading" ||
+              limitReached ||
+              !consentAccepted
+            }
+            className="group relative w-full self-start bg-clay px-8 py-4 font-grotesk text-[13px] font-medium uppercase tracking-[0.16em] text-canvas transition-opacity disabled:cursor-not-allowed disabled:opacity-40 sm:w-auto"
+          >
+            <span className="pointer-events-none absolute inset-0 translate-x-1.5 translate-y-1.5 border border-clay transition-transform duration-300 group-hover:translate-x-0 group-hover:translate-y-0 group-disabled:translate-x-1.5 group-disabled:translate-y-1.5" />
+            {status === "loading"
+              ? "Примеряем образ… обычно 15–40 сек"
+              : limitReached
+                ? "Лимит на сегодня исчерпан"
+                : selectedLook
+                  ? `Примерить образ · ${itemsPlural(selectedLook.itemCount)}`
+                  : "Выбери образ выше"}
+          </button>
+        </section>
+      ) : (
+        <>
+          {outerwearId && (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-hair-ink p-4 text-sm">
+              <span>
+                Второй слой:{" "}
+                {tops.find((item) => item.id === outerwearId)?.description ??
+                  "верхняя одежда"}
+              </span>
+              <button
+                type="button"
+                onClick={() => setOuterwearId(null)}
+                className="min-h-9 text-xs text-clay underline"
+              >
+                Убрать второй слой
+              </button>
+            </div>
+          )}
+          <Carousel title="Верх" count={tops.length}>
+            {tops.map((item) => (
+              <ItemThumb
+                key={item.id}
+                item={item}
+                selected={topId === item.id}
+                onClick={() => toggleTop(item.id)}
+              />
+            ))}
+          </Carousel>
+
+          <Carousel title="Низ" count={bottoms.length}>
+            {bottoms.map((item) => (
+              <ItemThumb
+                key={item.id}
+                item={item}
+                selected={bottomId === item.id}
+                onClick={() => toggleBottom(item.id)}
+              />
+            ))}
+          </Carousel>
+
+          {shoes.length > 0 && (
+            <Carousel title="Обувь" count={shoes.length}>
+              {shoes.map((item) => (
+                <ItemThumb
+                  key={item.id}
+                  item={item}
+                  selected={shoesId === item.id}
+                  onClick={() => toggleShoes(item.id)}
+                />
+              ))}
+            </Carousel>
+          )}
+
+          {bags.length > 0 && (
+            <Carousel title="Сумки" count={bags.length}>
+              {bags.map((item) => (
+                <ItemThumb
+                  key={item.id}
+                  item={item}
+                  selected={bagId === item.id}
+                  onClick={() => toggleBag(item.id)}
+                />
+              ))}
+            </Carousel>
+          )}
+
+          {!anchorId || visibleMatches.length === 0 ? (
+            <section>
+              <p className="border-b border-hair-ink pb-2.5 font-grotesk text-[10px] uppercase tracking-[0.3em] text-ink-soft">
+                Дополните образ
+              </p>
+              <p className="mt-4 font-grotesk text-sm text-ink-soft">
+                {!anchorId
+                  ? "Выбери вещь выше, чтобы увидеть, что к ней подходит."
+                  : "Пока нечего предложить к этому выбору."}
+              </p>
+            </section>
+          ) : (
+            <Carousel title="Дополните образ" count={visibleMatches.length}>
+              {visibleMatches.map((item) => (
+                <Link
+                  key={item.id}
+                  href={`/catalog/${item.id}`}
+                  className="group w-24 shrink-0 sm:w-28"
+                >
+                  <div className="relative aspect-[3/4] overflow-hidden bg-canvas-2 ring-1 ring-hair-ink">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={catalogImageUrl(item.imagePath)}
+                      alt={item.description ?? item.category}
+                      className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-105"
+                    />
+                  </div>
+                  <p className="mt-2 font-grotesk text-[10px] uppercase tracking-[0.12em] text-ink-soft">
+                    {CATEGORY_LABELS[item.category as CatalogCategory] ??
+                      item.category}
+                  </p>
+                </Link>
+              ))}
+            </Carousel>
+          )}
+
+          <button
+            type="button"
+            onClick={handleTryOn}
+            disabled={
+              selectedCount === 0 ||
+              status === "loading" ||
+              limitReached ||
+              !consentAccepted
+            }
+            className="group relative w-full self-start bg-clay px-8 py-4 font-grotesk text-[13px] font-medium uppercase tracking-[0.16em] text-canvas transition-opacity disabled:cursor-not-allowed disabled:opacity-40 sm:w-auto"
+          >
+            <span className="pointer-events-none absolute inset-0 translate-x-1.5 translate-y-1.5 border border-clay transition-transform duration-300 group-hover:translate-x-0 group-hover:translate-y-0 group-disabled:translate-x-1.5 group-disabled:translate-y-1.5" />
+            {status === "loading"
+              ? "Примеряем… обычно 15–40 сек"
+              : limitReached
+                ? "Лимит на сегодня исчерпан"
+                : `Примерить${selectedCount > 0 ? ` · ${selectedCount}` : ""}`}
+          </button>
+        </>
+      )}
+
+      {usage && (
+        <p className="font-grotesk text-[11px] uppercase tracking-[0.16em] text-ink-soft">
+          {usage.remaining > 0
+            ? `Осталось примерок сегодня: ${usage.remaining} из ${usage.limit}`
+            : `Лимит на сегодня исчерпан · ${usage.limit} в день · обновится завтра`}
+        </p>
+      )}
+
+      {error && (
+        <p
+          role="alert"
+          className="rounded-xl border-l-2 border-clay bg-clay/5 px-4 py-3 font-grotesk text-sm text-ink"
+        >
+          {error}
+        </p>
+      )}
+
+      {status === "loading" && (
+        <section
+          role="status"
+          aria-live="polite"
+          className="border-t border-hair-ink pt-8"
+        >
+          <p className="mb-4 text-sm leading-relaxed text-ink-soft">
+            Создаём твой образ. Обычно это занимает 15–40 секунд; при высокой
+            нагрузке — дольше. Не закрывай эту страницу.
+          </p>
+          <p className="font-grotesk text-[10px] uppercase tracking-[0.3em] text-ink-soft">
+            Результат
+          </p>
+          <div className="mt-4 grid max-w-2xl grid-cols-2 gap-4">
+            <div className="aspect-[3/4] animate-pulse bg-canvas-2 ring-1 ring-hair-ink" />
+            <div className="aspect-[3/4] animate-pulse bg-canvas-2 ring-1 ring-hair-ink" />
+          </div>
+        </section>
+      )}
+
+      {result && status === "idle" && (
+        <section className="animate-fade-in-up border-t border-hair-ink pt-8">
+          <p className="font-grotesk text-[10px] uppercase tracking-[0.3em] text-ink-soft">
+            Результат
+          </p>
+          <div className="mt-4 grid max-w-2xl grid-cols-2 gap-4">
+            <div>
+              <div className="relative aspect-[3/4] overflow-hidden bg-canvas-2 ring-1 ring-hair-ink">
+                <ResultImage src={profile.photoPath ?? ""} alt="До примерки" />
+              </div>
+              <p className="mt-2 text-center font-grotesk text-[10px] uppercase tracking-[0.24em] text-ink-soft">
+                До
+              </p>
+            </div>
+            <div>
+              <div className="relative aspect-[3/4] overflow-hidden bg-canvas-2 ring-1 ring-clay">
+                <ResultImage
+                  src={result.resultImagePath}
+                  alt="После примерки"
+                />
+              </div>
+              <p className="mt-2 text-center font-grotesk text-[10px] uppercase tracking-[0.24em] text-clay">
+                После
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() =>
+              downloadImage(result.resultImagePath, "smart-fashion-tryon.jpg")
+            }
+            className="mt-6 border border-hair-ink px-8 py-3.5 font-grotesk text-[12px] uppercase tracking-[0.16em] text-ink transition-colors hover:border-ink"
+          >
+            Скачать
+          </button>
+        </section>
+      )}
+
+      <section className="border-t border-hair-ink pt-8">
+        {history === null ? (
+          <>
+            <p className="font-grotesk text-[10px] uppercase tracking-[0.3em] text-ink-soft">
+              История примерок
+            </p>
+            <div className="no-scrollbar mt-4 flex gap-3 overflow-x-auto pb-1">
+              {[0, 1, 2].map((i) => (
+                <div
+                  key={i}
+                  className="aspect-[3/4] w-24 shrink-0 animate-pulse bg-canvas-2 sm:w-28"
+                />
+              ))}
+            </div>
+          </>
+        ) : history.length === 0 ? (
+          <>
+            <p className="font-grotesk text-[10px] uppercase tracking-[0.3em] text-ink-soft">
+              История примерок
+            </p>
+            <p className="mt-4 font-grotesk text-sm text-ink-soft">
+              Пусто — заверши первую примерку, и она появится здесь.
+            </p>
+          </>
+        ) : (
+          <Carousel title="История примерок" count={history.length}>
+            {history.map((entry) => (
+              <button
+                key={entry.id}
+                type="button"
+                onClick={() =>
+                  downloadImage(
+                    entry.resultImagePath,
+                    "smart-fashion-tryon.jpg",
+                  )
+                }
+                className="group w-24 shrink-0 text-left sm:w-28"
+                title="Скачать"
+              >
+                <div className="relative aspect-[3/4] overflow-hidden bg-canvas-2 ring-1 ring-hair-ink transition-all group-hover:ring-clay">
+                  <ResultImage
+                    src={entry.resultImagePath}
+                    alt={`Примерка от ${formatDate(entry.createdAt)}`}
+                  />
+                </div>
+                <p className="mt-2 font-grotesk text-[10px] text-ink-soft">
+                  {formatDate(entry.createdAt)}
+                </p>
+              </button>
+            ))}
+          </Carousel>
+        )}
+      </section>
+    </div>
+  );
+}
